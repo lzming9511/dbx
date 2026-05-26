@@ -1228,6 +1228,12 @@ export default {
     swap: "交换源和目标",
     syncProgress: "执行中: {current}/{total}",
     syncSummary: "成功 {success} 条，失败 {failed} 条",
+    syncPartial: "同步部分完成",
+    syncResultSummary: "成功 {success} 条，失败 {failed} 条",
+    syncErrors: "失败详情",
+    reCompare: "重新比较",
+    selectAll: "全选",
+    groupSummary: "已选择 {selected} 个（共 {total} 个）",
   },
   dataCompare: {
     title: "比较数据",

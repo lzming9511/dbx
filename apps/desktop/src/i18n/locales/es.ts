@@ -1143,6 +1143,12 @@ export default {
     swap: "Intercambiar origen y destino",
     syncProgress: "Ejecutando: {current}/{total}",
     syncSummary: "Exitosos {success}, fallidos {failed}",
+    syncPartial: "Sincronización parcialmente completada",
+    syncResultSummary: "Exitosos {success}, fallidos {failed}",
+    syncErrors: "Detalles de error",
+    reCompare: "Volver a comparar",
+    selectAll: "Seleccionar todo",
+    groupSummary: "{selected} seleccionados (de {total})",
   },
   dataCompare: {
     title: "Comparar datos",
