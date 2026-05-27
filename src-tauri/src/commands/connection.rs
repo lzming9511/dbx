@@ -156,6 +156,12 @@ mod tests {
             connection_string: Some(
                 "mongodb://mongouser:secret@172.22.4.42:27017/RestCloud_V45PUB_Gateway?authSource=admin".to_string(),
             ),
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -223,7 +229,7 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 }
                 Err(e) => Err(e),
             },
-            DatabaseType::Mysql => match db::mysql::connect(&url).await {
+            DatabaseType::Mysql => match db::mysql::connect_with_ca_cert(&url, Some(&config.ca_cert_path)).await {
                 Ok(pool) => {
                     let _ = pool.disconnect().await;
                     Ok("Connection successful".to_string())
@@ -250,7 +256,15 @@ pub async fn test_connection(state: State<'_, Arc<AppState>>, config: Connection
                 Ok(_) => Ok("Connection successful".to_string()),
                 Err(e) => Err(e),
             },
-            DatabaseType::Redis => db::redis_driver::connect(&url).await.map(|_| "Connection successful".to_string()),
+            DatabaseType::Redis => {
+                let con = if config.uses_redis_sentinel() {
+                    db::redis_driver::connect_sentinel(&config).await?
+                } else {
+                    db::redis_driver::connect(&url).await?
+                };
+                drop(con);
+                Ok("Connection successful".to_string())
+            }
             DatabaseType::DuckDb => {
                 if state.duckdb_existing_pool_is_usable_for_config(&config).await? {
                     Ok("Connection successful".to_string())
@@ -348,7 +362,10 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         DatabaseType::Mysql if db_config.needs_bare_mysql() => {
             PoolKind::Mysql(db::mysql::connect_bare(&url).await?, MysqlMode::Bare)
         }
-        DatabaseType::Mysql => PoolKind::Mysql(db::mysql::connect(&url).await?, MysqlMode::Normal),
+        DatabaseType::Mysql => PoolKind::Mysql(
+            db::mysql::connect_with_ca_cert(&url, Some(&db_config.ca_cert_path)).await?,
+            MysqlMode::Normal,
+        ),
         DatabaseType::Doris | DatabaseType::StarRocks => {
             PoolKind::Mysql(db::mysql::connect_bare(&url).await?, MysqlMode::Bare)
         }
@@ -357,7 +374,11 @@ pub async fn connect_db(state: State<'_, Arc<AppState>>, config: ConnectionConfi
         }
         DatabaseType::Sqlite => PoolKind::Sqlite(db::sqlite::connect_path(&expand_tilde(&db_config.host)).await?),
         DatabaseType::Redis => {
-            let con = db::redis_driver::connect(&url).await?;
+            let con = if db_config.uses_redis_sentinel() {
+                db::redis_driver::connect_sentinel(&db_config).await?
+            } else {
+                db::redis_driver::connect(&url).await?
+            };
             PoolKind::Redis(tokio::sync::Mutex::new(con))
         }
         DatabaseType::DuckDb => {

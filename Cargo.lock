@@ -1545,6 +1545,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
 dependencies = [
  "generic-array 0.14.7",
+ "rand_core 0.6.4",
  "typenum",
 ]
 
@@ -1788,7 +1789,7 @@ dependencies = [
 
 [[package]]
 name = "dbx"
-version = "0.5.21"
+version = "0.5.22"
 dependencies = [
  "anyhow",
  "calamine",
@@ -1833,7 +1834,9 @@ dependencies = [
 name = "dbx-core"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm 0.10.3",
  "anyhow",
+ "argon2",
  "async-trait",
  "base64 0.22.1",
  "bytes",
@@ -1842,6 +1845,7 @@ dependencies = [
  "csv",
  "deadpool-postgres",
  "duckdb",
+ "encoding_rs",
  "font-kit",
  "futures",
  "iana-time-zone",
@@ -1859,6 +1863,7 @@ dependencies = [
  "rustls 0.23.40",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlparser",
  "tiberius",
  "tokio",
@@ -1872,7 +1877,7 @@ dependencies = [
 
 [[package]]
 name = "dbx-web"
-version = "0.5.21"
+version = "0.5.22"
 dependencies = [
  "argon2",
  "async-stream",
@@ -6004,6 +6009,7 @@ dependencies = [
  "num-bigint",
  "percent-encoding",
  "pin-project-lite",
+ "rand 0.9.4",
  "rustls 0.23.40",
  "rustls-native-certs 0.8.3",
  "ryu",

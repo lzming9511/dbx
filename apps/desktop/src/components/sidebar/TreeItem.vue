@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, nextTick, watch } from "vue";
+import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
 import { useI18n } from "vue-i18n";
 import { translateBackendError } from "@/i18n/backend-errors";
 import {
@@ -137,6 +138,7 @@ const queryStore = useQueryStore();
 const savedSqlStore = useSavedSqlStore();
 const settingsStore = useSettingsStore();
 const { toast } = useToast();
+const { highlight } = useSqlHighlighter();
 const { getDatabaseOptions } = useDatabaseOptions();
 const showVisibleDatabasesDialog = ref(false);
 
@@ -1570,6 +1572,12 @@ const columnComment = computed(() =>
     ? (props.node.meta as any).comment
     : null,
 );
+const tableComment = computed(() =>
+  (props.node.type === "table" || props.node.type === "view" || props.node.type === "mongo-collection") &&
+  props.node.comment
+    ? props.node.comment
+    : null,
+);
 const paddingLeft = computed(() => treeItemPaddingLeft(props.depth));
 const isConnected = computed(
   () =>
@@ -1890,6 +1898,12 @@ const isDragging = computed(() => dragState.active && dragState.draggedId === pr
             columnComment
           }}</span>
           <span
+            v-if="tableComment"
+            class="truncate text-muted-foreground/60 text-[10px] max-w-[25%] group-hover:hidden"
+            :title="tableComment"
+            >{{ tableComment }}</span
+          >
+          <span
             v-if="
               node.type === 'connection' && node.connectionId && connectionStore.connectedIds.has(node.connectionId)
             "
@@ -2071,6 +2085,8 @@ const isDragging = computed(() => dragState.active && dragState.draggedId === pr
       </template>
 
       <template v-if="node.type === 'table' || node.type === 'view'">
+        <ContextMenuItem @click="copyName"> <Copy class="w-4 h-4" /> {{ t("contextMenu.copyName") }} </ContextMenuItem>
+        <ContextMenuSeparator />
         <ContextMenuItem @click="openData">
           <TableProperties class="w-4 h-4" /> {{ t("contextMenu.viewData") }}
         </ContextMenuItem>
@@ -2299,8 +2315,8 @@ const isDragging = computed(() => dragState.active && dragState.draggedId === pr
         <pre
           v-if="renameObjectPreviewSql"
           class="max-h-32 overflow-auto rounded bg-muted p-3 text-xs whitespace-pre-wrap"
-          >{{ renameObjectPreviewSql }}</pre
-        >
+          v-html="highlight(renameObjectPreviewSql)"
+        ></pre>
         <p v-if="renameObjectError" class="text-sm text-destructive">{{ renameObjectError }}</p>
       </div>
       <DialogFooter>

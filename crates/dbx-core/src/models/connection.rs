@@ -63,6 +63,18 @@ pub struct ConnectionConfig {
     pub oracle_connection_type: Option<String>,
     #[serde(default)]
     pub connection_string: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redis_connection_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redis_sentinel_master: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redis_sentinel_nodes: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redis_sentinel_username: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub redis_sentinel_password: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub redis_sentinel_tls: bool,
     /// Typed configuration for external tabular sources.
     #[serde(default)]
     pub external_config: Option<serde_json::Value>,
@@ -232,6 +244,11 @@ impl ConnectionConfig {
             }
         }
         config
+    }
+
+    pub fn uses_redis_sentinel(&self) -> bool {
+        self.db_type == DatabaseType::Redis
+            && self.redis_connection_mode.as_deref().is_some_and(|mode| mode.eq_ignore_ascii_case("sentinel"))
     }
 
     pub fn connection_url(&self) -> String {
@@ -494,26 +511,7 @@ impl ConnectionConfig {
             };
         }
         match self.db_type {
-            DatabaseType::Mysql => {
-                let base = "ssl-mode=preferred&charset=utf8mb4";
-                if value.is_empty() {
-                    base.to_string()
-                } else if value.contains("ssl-mode=") {
-                    let v = value.trim_start_matches('?');
-                    if v.contains("charset=") {
-                        v.to_string()
-                    } else {
-                        format!("{v}&charset=utf8mb4")
-                    }
-                } else {
-                    let v = value.trim_start_matches('?');
-                    if v.contains("charset=") {
-                        format!("ssl-mode=preferred&{v}")
-                    } else {
-                        format!("{base}&{v}")
-                    }
-                }
-            }
+            DatabaseType::Mysql => normalize_mysql_url_params(value, self.ssl, self.ca_cert_path.trim().is_empty()),
             DatabaseType::Doris | DatabaseType::StarRocks => {
                 let v = value.trim_start_matches('?');
                 let filtered: Vec<&str> = v
@@ -526,7 +524,7 @@ impl ConnectionConfig {
                     format!("ssl-mode=disabled&{}", filtered.join("&"))
                 }
             }
-            DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value),
+            DatabaseType::Postgres | DatabaseType::Redshift => normalize_postgres_url_params(value, self.ssl),
             DatabaseType::MongoDb => value.trim_start_matches('?').to_string(),
             _ => value.trim_start_matches('?').to_string(),
         }
@@ -543,11 +541,36 @@ fn url_params_contains_flag(params: Option<&str>, key: &str, expected: &str) -> 
     )
 }
 
-fn normalize_postgres_url_params(value: &str) -> String {
+fn normalize_mysql_url_params(value: &str, force_tls: bool, accept_invalid_certs: bool) -> String {
     let value = value.trim_start_matches('?');
-    if value.is_empty() {
-        return String::new();
+    let mut parts: Vec<String> = value.split('&').filter(|part| !part.is_empty()).map(str::to_string).collect();
+
+    if force_tls {
+        parts.retain(|part| !url_param_key_is(part, "ssl-mode") && !url_param_key_is(part, "sslmode"));
+        if !parts.iter().any(|part| url_param_key_is(part, "require_ssl")) {
+            parts.insert(0, "require_ssl=true".to_string());
+        }
+        if accept_invalid_certs && !parts.iter().any(|part| url_param_key_is(part, "verify_ca")) {
+            parts.push("verify_ca=false".to_string());
+        }
+        if !parts.iter().any(|part| url_param_key_is(part, "verify_identity")) {
+            parts.push("verify_identity=false".to_string());
+        }
+    } else if !parts.iter().any(|part| {
+        url_param_key_is(part, "ssl-mode") || url_param_key_is(part, "sslmode") || url_param_key_is(part, "require_ssl")
+    }) {
+        parts.insert(0, "ssl-mode=preferred".to_string());
     }
+
+    if !parts.iter().any(|part| url_param_key_is(part, "charset")) {
+        parts.push("charset=utf8mb4".to_string());
+    }
+
+    parts.join("&")
+}
+
+fn normalize_postgres_url_params(value: &str, force_tls: bool) -> String {
+    let value = value.trim_start_matches('?');
 
     let mut timezone: Option<String> = None;
     let mut parts: Vec<String> = Vec::new();
@@ -560,12 +583,32 @@ fn normalize_postgres_url_params(value: &str) -> String {
             if !decoded_value.is_empty() {
                 timezone = Some(decoded_value);
             }
+        } else if key.eq_ignore_ascii_case("ssl-mode") {
+            let decoded_value = percent_decode_str(raw_value).decode_utf8_lossy();
+            match decoded_value.to_ascii_lowercase().replace('_', "-").as_str() {
+                "require" | "required" => parts.push("sslmode=require".to_string()),
+                "prefer" | "preferred" => parts.push("sslmode=prefer".to_string()),
+                "disable" | "disabled" => parts.push("sslmode=disable".to_string()),
+                "verify-ca" => parts.push("sslmode=verify-ca".to_string()),
+                "verify-full" | "verify-identity" => parts.push("sslmode=verify-full".to_string()),
+                _ => {}
+            }
+        } else if key.eq_ignore_ascii_case("charset")
+            || key.eq_ignore_ascii_case("require_ssl")
+            || key.eq_ignore_ascii_case("verify_ca")
+            || key.eq_ignore_ascii_case("verify_identity")
+        {
+            // These MySQL-style parameters may be present in older/imported
+            // saved connections. tokio-postgres rejects unknown URL keys.
         } else {
             parts.push(part.to_string());
         }
     }
 
     let Some(timezone) = timezone else {
+        if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+            parts.insert(0, "sslmode=require".to_string());
+        }
         return parts.join("&");
     };
 
@@ -585,7 +628,16 @@ fn normalize_postgres_url_params(value: &str) -> String {
         parts.push(format!("options={}", encode_url_part(&timezone_option)));
     }
 
+    if force_tls && !parts.iter().any(|part| url_param_key_is(part, "sslmode")) {
+        parts.insert(0, "sslmode=require".to_string());
+    }
+
     parts.join("&")
+}
+
+fn url_param_key_is(part: &str, expected: &str) -> bool {
+    let key = part.split_once('=').map(|(key, _)| key).unwrap_or(part);
+    percent_decode_str(key).decode_utf8_lossy().eq_ignore_ascii_case(expected)
 }
 
 fn clickhouse_http_url(config: &ConnectionConfig, host: &str, port: u16) -> String {
@@ -759,6 +811,12 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -986,12 +1044,44 @@ mod tests {
     }
 
     #[test]
+    fn mysql_tls_switch_requires_ssl_without_strict_certificate_checks_by_default() {
+        let mut config = mysql_config("root", "secret", Some("test"));
+        config.ssl = true;
+
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/test?require_ssl=true&verify_ca=false&verify_identity=false&charset=utf8mb4"
+        );
+    }
+
+    #[test]
+    fn mysql_tls_switch_uses_ca_cert_for_ca_validation() {
+        let mut config = mysql_config("root", "secret", Some("test"));
+        config.ssl = true;
+        config.ca_cert_path = "/tmp/tidb-ca.pem".to_string();
+
+        assert_eq!(
+            config.connection_url(),
+            "mysql://root:secret@10.1.2.3:2883/test?require_ssl=true&verify_identity=false&charset=utf8mb4"
+        );
+    }
+
+    #[test]
     fn postgres_url_appends_custom_params() {
         let mut config = mysql_config("postgres", "secret", Some("test"));
         config.db_type = DatabaseType::Postgres;
         config.url_params = Some("sslmode=disable".to_string());
 
         assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=disable");
+    }
+
+    #[test]
+    fn postgres_tls_switch_adds_require_sslmode() {
+        let mut config = mysql_config("postgres", "secret", Some("test"));
+        config.db_type = DatabaseType::Postgres;
+        config.ssl = true;
+
+        assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=require");
     }
 
     #[test]
@@ -1006,6 +1096,26 @@ mod tests {
         );
         let pg_config = tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
         assert_eq!(pg_config.get_options(), Some("-c TimeZone=Asia/Shanghai"));
+    }
+
+    #[test]
+    fn postgres_url_ignores_mysql_only_params_from_saved_connections() {
+        let mut config = mysql_config("postgres", "secret", Some("test"));
+        config.db_type = DatabaseType::Postgres;
+        config.url_params = Some("ssl-mode=preferred&charset=utf8mb4".to_string());
+
+        assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=prefer");
+        tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
+    }
+
+    #[test]
+    fn postgres_url_maps_mysql_ssl_mode_require_to_sslmode() {
+        let mut config = mysql_config("postgres", "secret", Some("test"));
+        config.db_type = DatabaseType::Postgres;
+        config.url_params = Some("ssl-mode=required&verify_ca=false&verify_identity=false".to_string());
+
+        assert_eq!(config.connection_url(), "postgres://postgres:secret@10.1.2.3:2883/test?sslmode=require");
+        tokio_postgres::Config::from_str(&config.connection_url()).unwrap();
     }
 
     #[test]

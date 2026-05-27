@@ -157,11 +157,16 @@ import { useDataGridExport } from "@/composables/useDataGridExport";
 import { useDataGridColumnResize } from "@/composables/useDataGridColumnResize";
 import { useDataGridSelection } from "@/composables/useDataGridSelection";
 import { useDataGridEditor } from "@/composables/useDataGridEditor";
+import { useSqlHighlighter } from "@/composables/useSqlHighlighter";
+import { useCellDetailEditor, type UseCellDetailEditorReturn } from "@/composables/useCellDetailEditor";
+import { useTheme } from "@/composables/useTheme";
 import { useSettingsStore } from "@/stores/settingsStore";
 
 const { t } = useI18n();
 const settingsStore = useSettingsStore();
+const { isDark } = useTheme();
 const { toast } = useToast();
+const { highlight } = useSqlHighlighter();
 
 interface PreparedCopyValue {
   key: string;
@@ -395,6 +400,7 @@ type StructuredFilterRule = {
   columnName: string;
   mode: FilterMode;
   rawValue: string;
+  conjunction: "AND" | "OR";
 };
 
 const localColumnFilters = ref<Record<number, Set<string>>>({});
@@ -842,6 +848,7 @@ function defaultStructuredFilterRule(): StructuredFilterRule {
     columnName: filterBuilderColumnOptions.value[0] ?? "",
     mode: "equals",
     rawValue: "",
+    conjunction: "AND",
   };
 }
 
@@ -884,28 +891,68 @@ async function clearAllFilters() {
   await applyWhereFilter();
 }
 
+function buildGroupedWhere(conditions: string[], rules: StructuredFilterRule[]): string {
+  if (conditions.length === 0) return "";
+  if (conditions.length === 1) return conditions[0];
+
+  const groups: { conditions: string[]; conjunction: string }[] = [];
+  let current = { conditions: [conditions[0]], conjunction: "AND" };
+
+  for (let i = 1; i < conditions.length; i++) {
+    const conj = rules[i].conjunction;
+    if (conj !== current.conjunction) {
+      groups.push(current);
+      current = { conditions: [conditions[i]], conjunction: conj };
+    } else {
+      current.conditions.push(conditions[i]);
+    }
+  }
+  groups.push(current);
+
+  if (groups.length === 1) {
+    const g = groups[0];
+    return g.conditions.length > 1 ? `(${g.conditions.join(` ${g.conjunction} `)})` : g.conditions[0];
+  }
+
+  const groupClauses = groups.map((g) => {
+    const inner = g.conditions.join(` ${g.conjunction} `);
+    return g.conditions.length > 1 ? `(${inner})` : inner;
+  });
+
+  let result = groupClauses[0];
+  for (let i = 1; i < groupClauses.length; i++) {
+    result = `(${result}) ${groups[i].conjunction} (${groupClauses[i]})`;
+  }
+  return result;
+}
+
 async function applyStructuredFilters() {
   if (!canUseWhereSearch.value) return;
-  const conditions = (
+  const rulesWithConditions = (
     await Promise.all(
       structuredFilterRules.value.map(async (rule) => {
-        if (!rule.columnName) return null;
-        if (filterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return null;
+        if (!rule.columnName) return { rule, condition: null };
+        if (filterModeNeedsValue(rule.mode) && !rule.rawValue.trim()) return { rule, condition: null };
         const columnInfo = filterBuilderColumns.value.find((column) => column.name === rule.columnName);
-        return (
-          (await buildDataGridContextFilterCondition({
-            databaseType: props.databaseType,
-            columnName: rule.columnName,
-            columnInfo,
-            mode: rule.mode,
-            value: filterModeNeedsValue(rule.mode) ? parseFilterValue(rule.rawValue, columnInfo) : null,
-          })) ?? null
-        );
+        return {
+          rule,
+          condition:
+            (await buildDataGridContextFilterCondition({
+              databaseType: props.databaseType,
+              columnName: rule.columnName,
+              columnInfo,
+              mode: rule.mode,
+              value: filterModeNeedsValue(rule.mode) ? parseFilterValue(rule.rawValue, columnInfo) : null,
+            })) ?? null,
+        };
       }),
     )
-  ).filter((condition): condition is string => !!condition);
+  ).filter((item): item is { rule: StructuredFilterRule; condition: string } => !!item.condition);
 
-  appliedStructuredWhereInput.value = conditions.join(" AND ");
+  appliedStructuredWhereInput.value = buildGroupedWhere(
+    rulesWithConditions.map((item) => item.condition),
+    rulesWithConditions.map((item) => item.rule),
+  );
   filterBuilderOpen.value = false;
   await applyWhereFilter();
 }
@@ -1923,9 +1970,14 @@ const {
   hasCellSelection,
   clearCellSelection,
   selectSingleCell,
+  selectRow,
+  selectColumn,
+  selectAllCells,
+  extendCellSelectionTo,
   finishCellSelection,
   extendCellSelection,
   cellIsSelected,
+  columnIsSelected,
   selectedRangeStart,
   selectedRowIds,
   hasRowSelection,
@@ -1949,6 +2001,12 @@ const multiRowCount = computed(() => {
 });
 
 const isMultiRow = computed(() => multiRowCount.value > 1);
+const copyRowJsonLabel = computed(() => {
+  if (isTransposeMode.value) {
+    return isMultiRow.value ? t("grid.copyColumnsJson", { count: multiRowCount.value }) : t("grid.copyColumnJson");
+  }
+  return isMultiRow.value ? t("grid.copyRows", { count: multiRowCount.value }) : t("grid.copyRow");
+});
 
 function onCellMouseenter(rowIndex: number, visibleColIdx: number, actualColIdx: number) {
   hoveredDetailCell.value = { rowIndex, col: actualColIdx };
@@ -2000,6 +2058,9 @@ function isRowActive(index: number): boolean {
   if (item && isRowSelected(item.id)) return true;
   const range = selectedRange.value;
   if (!range) return false;
+  const coversAllVisibleRows = range.startRow === 0 && range.endRow >= displayItems.value.length - 1;
+  const coversAllVisibleColumns = range.startCol === 0 && range.endCol >= visibleColumnCount.value - 1;
+  if (coversAllVisibleRows && !coversAllVisibleColumns) return false;
   return index >= range.startRow && index <= range.endRow;
 }
 
@@ -2159,6 +2220,60 @@ const detailTemporalEditorKind = computed(() => {
   return detail ? temporalEditorKindForColumn(detail.colIndex) : undefined;
 });
 
+// CodeMirror-based cell detail editors
+const detailsEditorContainer = ref<HTMLElement>();
+const valueEditorContainer = ref<HTMLElement>();
+let detailsDetailEditor: UseCellDetailEditorReturn | null = null;
+let valueDetailEditor: UseCellDetailEditorReturn | null = null;
+
+const editorThemeAccessor = () => settingsStore.editorSettings.theme;
+const editorAppAppearance = () => (isDark.value ? "dark" : "light") as import("@/lib/appTheme").AppThemeAppearance;
+const editorFontSize = () => settingsStore.editorSettings.fontSize;
+const editorFontFamily = () => settingsStore.editorSettings.fontFamily;
+
+function getDetailEditor(): UseCellDetailEditorReturn | null {
+  return activeCellDetailTab.value === "valueEditor" ? valueDetailEditor : detailsDetailEditor;
+}
+
+watch(detailsEditorContainer, async (el) => {
+  if (el && !detailsDetailEditor) {
+    detailsDetailEditor = useCellDetailEditor({
+      onChange: (v) => {
+        detailEditValue.value = v;
+      },
+      onEscape: () => cancelDetailEdit(),
+      editorTheme: editorThemeAccessor,
+      appAppearance: editorAppAppearance,
+      fontSize: editorFontSize,
+      fontFamily: editorFontFamily,
+    });
+    await detailsDetailEditor.create(el, detailEditValue.value, activeCellDetail.value?.type);
+  } else if (!el && detailsDetailEditor) {
+    detailsDetailEditor.destroy();
+    detailsDetailEditor = null;
+  }
+});
+
+watch(valueEditorContainer, async (el) => {
+  if (el && !valueDetailEditor) {
+    valueDetailEditor = useCellDetailEditor({
+      onChange: (v) => {
+        detailEditValue.value = v;
+      },
+      onEscape: () => restoreDetailOriginalValue(),
+      onBlur: () => commitValueEditorEdit(),
+      editorTheme: editorThemeAccessor,
+      appAppearance: editorAppAppearance,
+      fontSize: editorFontSize,
+      fontFamily: editorFontFamily,
+    });
+    await valueDetailEditor.create(el, detailEditValue.value, activeCellDetail.value?.type);
+  } else if (!el && valueDetailEditor) {
+    valueDetailEditor.destroy();
+    valueDetailEditor = null;
+  }
+});
+
 function resetDetailEdit() {
   isEditingDetail.value = false;
   detailEditValue.value = "";
@@ -2214,10 +2329,18 @@ function cancelDetailEdit() {
   resetDetailEdit();
 }
 
+function syncEditorFromDetailEdit() {
+  const editor = getDetailEditor();
+  if (editor) {
+    editor.setValue(detailEditValue.value, activeCellDetail.value?.type);
+  }
+}
+
 function cancelValueEditorEdit() {
   const detail = activeCellDetail.value;
   if (!detail || !detail.isEditable) return;
   detailEditValue.value = cellDetailEditorText(detail.value, detail.type);
+  syncEditorFromDetailEdit();
   isEditingDetail.value = true;
 }
 
@@ -2249,6 +2372,7 @@ function restoreDetailOriginalValue() {
   }
 
   detailEditValue.value = cellDetailEditorText(restoredValue, detail.type);
+  syncEditorFromDetailEdit();
   isEditingDetail.value = activeCellDetailTab.value === "valueEditor";
   detailCell.value = { ...detailCell.value! };
 }
@@ -2256,6 +2380,7 @@ function restoreDetailOriginalValue() {
 function setValueEditorNull() {
   setDetailNull();
   detailEditValue.value = cellDetailEditorText(null);
+  syncEditorFromDetailEdit();
   isEditingDetail.value = activeCellDetailTab.value === "valueEditor";
 }
 
@@ -2263,6 +2388,7 @@ function formatValueEditorJson() {
   const detail = activeCellDetail.value;
   if (!detail || !canFormatCellDetailJson(detailEditValue.value, detail.type)) return;
   detailEditValue.value = formatJsonText(detailEditValue.value) ?? detailEditValue.value;
+  syncEditorFromDetailEdit();
 }
 
 function setDetailNull() {
@@ -2493,6 +2619,7 @@ const {
   copySelectionCsv,
   copySelectionJson,
   copySelectionSqlInList,
+  copySelectedRowsTsv,
   exportCsv,
   exportJson,
   exportMarkdown,
@@ -2526,6 +2653,37 @@ function showCellDetailsForVisibleCell(rowIndex: number, visibleColIdx: number, 
   clearRowSelection();
   selectSingleCell(rowIndex, visibleColIdx);
   showCellDetails(rowIndex, actualColIdx);
+}
+
+function transposeCellIsSelected(rowIndex: number, actualColIdx: number) {
+  const visibleColIdx = visibleColumnIndexes.value.indexOf(actualColIdx);
+  return visibleColIdx >= 0 && cellIsSelected(rowIndex, visibleColIdx);
+}
+
+function onTransposeCellMouseenter(rowIndex: number, actualColIdx: number) {
+  hoveredDetailCell.value = { rowIndex, col: actualColIdx };
+}
+
+function selectTransposeCell(rowIndex: number, actualColIdx: number, event: MouseEvent) {
+  const visibleColIdx = visibleColumnIndexes.value.indexOf(actualColIdx);
+  if (visibleColIdx < 0) return;
+  contextHeaderColumn.value = null;
+  clearRowSelection();
+  if (event.shiftKey || event.metaKey || event.ctrlKey) {
+    extendCellSelectionTo(rowIndex, visibleColIdx);
+  } else {
+    selectSingleCell(rowIndex, visibleColIdx);
+  }
+  transposeRowIndex.value = rowIndex;
+  showCellDetails(rowIndex, actualColIdx);
+  gridRef.value?.focus({ preventScroll: true });
+}
+
+function onTransposeCellContext(rowIndex: number, actualColIdx: number, event: MouseEvent) {
+  selectTransposeCell(rowIndex, actualColIdx, event);
+  const item = displayItems.value[rowIndex];
+  contextCell.value = item ? { rowId: item.id, rowIndex, col: actualColIdx } : null;
+  void prefetchCopyStatements();
 }
 
 watch([selectedRange, showCellDetail, isEditingDetail], () => {
@@ -2607,6 +2765,23 @@ function scrollCellIntoView(rowIndex: number, colIndex: number) {
   });
 }
 
+function scrollGridRowIntoView(rowIndex: number) {
+  const target = Math.max(0, Math.min(displayItems.value.length - 1, rowIndex));
+  nextTick(() => {
+    const scroller = scrollerRef.value;
+    if (scroller && !(scroller instanceof HTMLElement)) {
+      scroller.scrollToItem?.(target);
+      scroller.scrollToPosition?.(target * 26);
+    } else if (scroller instanceof HTMLElement) {
+      scroller.scrollTop = target * 26;
+    }
+    requestAnimationFrame(() => {
+      const rowEl = gridRef.value?.querySelector<HTMLElement>(`[data-row-index="${target}"]`);
+      rowEl?.scrollIntoView({ block: "nearest", inline: "nearest" });
+    });
+  });
+}
+
 function currentTransposeRequestedRowIndex(): number {
   const position = currentSelectedCellPosition();
   if (position) return position.rowIndex;
@@ -2616,10 +2791,11 @@ function currentTransposeRequestedRowIndex(): number {
 
 function toggleKeyboardTranspose(): boolean {
   if (displayItems.value.length === 0) return false;
+  const requestedRowIndex = currentTransposeRequestedRowIndex();
   const next = nextKeyboardTransposeState({
     showTranspose: showTranspose.value,
     transposeRowIndex: transposeRowIndex.value,
-    requestedRowIndex: currentTransposeRequestedRowIndex(),
+    requestedRowIndex,
     rowIds: displayItems.value.map((item) => item.id),
     selectedRowIds: selectedRowIds.value,
     selectedRange: selectedRange.value,
@@ -2630,6 +2806,8 @@ function toggleKeyboardTranspose(): boolean {
     closeCellDetails();
     nextTick(updateTransposeViewport);
     if (next.transposeRowIndex !== null) scrollTransposeRecordIntoView(next.transposeRowIndex);
+  } else {
+    scrollGridRowIntoView(requestedRowIndex);
   }
   return true;
 }
@@ -2744,9 +2922,23 @@ async function onGridKeydown(event: KeyboardEvent) {
     return;
   }
   if (clipboardShortcut(event, "c")) {
-    if (!hasCellSelection.value) return;
+    if (!hasCellSelection.value && !hasRowSelection.value) return;
     event.preventDefault();
-    copySelectionTsv();
+    if (isTransposeMode.value && hasRowSelection.value) {
+      copyRow();
+      return;
+    }
+    if (hasCellSelection.value) {
+      copySelectionTsv();
+    } else {
+      copySelectedRowsTsv();
+    }
+    return;
+  }
+  if (clipboardShortcut(event, "a")) {
+    if (!hasData.value) return;
+    event.preventDefault();
+    selectAllCells();
     return;
   }
   if (clipboardShortcut(event, "x")) {
@@ -2903,9 +3095,17 @@ function onTransposeRecordResizeStart(event: MouseEvent) {
   document.addEventListener("mouseup", onUp);
 }
 
-function closeTranspose() {
+function currentTransposeViewportRowIndex(): number {
+  if (displayItems.value.length === 0) return 0;
+  const rowIndex = transposeRowIndex.value ?? transposeRecordWindow.value.start;
+  return Math.max(0, Math.min(displayItems.value.length - 1, rowIndex));
+}
+
+function closeTranspose(scrollToCurrentRecord = true) {
+  const rowIndex = currentTransposeViewportRowIndex();
   showTranspose.value = false;
   transposeRowIndex.value = null;
+  if (scrollToCurrentRecord) scrollGridRowIntoView(rowIndex);
 }
 
 function openContextTranspose() {
@@ -2939,12 +3139,27 @@ function toggleTranspose(rowIndex: number) {
     closeCellDetails();
     nextTick(updateTransposeViewport);
     if (next.transposeRowIndex !== null) scrollTransposeRecordIntoView(next.transposeRowIndex);
+  } else {
+    scrollGridRowIntoView(rowIndex);
   }
 }
 
-function selectTransposeRecord(rowIndex: number) {
+function selectTransposeRecord(rowIndex: number, event?: MouseEvent) {
   if (rowIndex < 0 || rowIndex >= displayItems.value.length) return;
   transposeRowIndex.value = rowIndex;
+  contextHeaderColumn.value = null;
+  const item = displayItems.value[rowIndex];
+  if (item) {
+    if (event) {
+      handleRowClick(rowIndex, item.id, event);
+    } else {
+      selectedRowIds.value = new Set([item.id]);
+      selection.lastClickedRowIndex.value = rowIndex;
+      selectRow(rowIndex);
+    }
+    contextCell.value = { rowId: item.id, rowIndex, col: -1 };
+    void prefetchCopyStatements();
+  }
   gridRef.value?.focus({ preventScroll: true });
 }
 
@@ -2982,7 +3197,7 @@ watch(
         nextTransposeStateForRecordCount(showTranspose.value, transposeRowIndex.value, displayItems.value.length),
       );
     } else {
-      closeTranspose();
+      closeTranspose(false);
     }
     exitTransaction();
   },
@@ -3327,34 +3542,7 @@ onUnmounted(() => {
   clearInterval(_loadingTimer);
 });
 
-const SQL_KEYWORDS =
-  /\b(CREATE|TABLE|INDEX|UNIQUE|PRIMARY|KEY|FOREIGN|REFERENCES|CONSTRAINT|NOT|NULL|DEFAULT|INT|INTEGER|BIGINT|SMALLINT|VARCHAR|CHARACTER|VARYING|TEXT|BOOLEAN|DOUBLE|PRECISION|REAL|FLOAT|NUMERIC|DECIMAL|TIMESTAMP|DATE|TIME|SERIAL|AUTOINCREMENT|AUTO_INCREMENT|IF|EXISTS|ON|SET|CASCADE|RESTRICT|CHECK|WITH|WITHOUT|ZONE)\b/gi;
-
-function highlightSql(sql: string): string {
-  const tokens: string[] = [];
-  let rest = sql;
-  const re = /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g;
-  let match: RegExpExecArray | null;
-  let last = 0;
-  while ((match = re.exec(rest)) !== null) {
-    if (match.index > last) tokens.push(escapeAndHighlightKeywords(rest.slice(last, match.index)));
-    const q = match[1];
-    const escaped = q.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const cls = q.startsWith('"') ? "ddl-ident" : "ddl-str";
-    tokens.push(`<span class="${cls}">${escaped}</span>`);
-    last = re.lastIndex;
-  }
-  if (last < rest.length) tokens.push(escapeAndHighlightKeywords(rest.slice(last)));
-  return tokens.join("");
-}
-
-function escapeAndHighlightKeywords(s: string): string {
-  return s
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(SQL_KEYWORDS, '<span class="ddl-kw">$1</span>');
-}
+const highlightedDdlContent = computed(() => highlight(ddlContent.value));
 
 defineExpose({
   useTransaction,
@@ -3473,78 +3661,92 @@ defineExpose({
                         </div>
 
                         <div v-if="structuredFilterRules.length" class="space-y-2">
-                          <div
-                            v-for="rule in structuredFilterRules"
-                            :key="rule.id"
-                            class="grid grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1.2fr)_auto] items-center gap-2"
-                          >
-                            <Select
-                              :model-value="rule.columnName"
-                              @update:model-value="
-                                (value: any) => updateStructuredFilterRule(rule.id, { columnName: String(value) })
-                              "
-                            >
-                              <SelectTrigger class="h-8 min-w-0 text-xs">
-                                <SelectValue :placeholder="t('grid.filterBuilderColumn')" />
-                              </SelectTrigger>
-                              <SelectContent position="popper">
-                                <SelectItem
-                                  v-for="columnName in filterBuilderColumnOptions"
-                                  :key="columnName"
-                                  :value="columnName"
-                                >
-                                  {{ columnName }}
-                                </SelectItem>
-                              </SelectContent>
-                            </Select>
-
-                            <Select
-                              :model-value="rule.mode"
-                              @update:model-value="
-                                (value: any) => updateStructuredFilterRule(rule.id, { mode: value as FilterMode })
-                              "
-                            >
-                              <SelectTrigger class="h-8 min-w-0 text-xs">
-                                <SelectValue />
-                              </SelectTrigger>
-                              <SelectContent position="popper">
-                                <SelectItem
-                                  v-for="option in filterModeOptions"
-                                  :key="option.value"
-                                  :value="option.value"
-                                >
-                                  {{ t(option.labelKey) }}
-                                </SelectItem>
-                              </SelectContent>
-                            </Select>
-
-                            <Input
-                              v-if="filterModeNeedsValue(rule.mode)"
-                              :model-value="rule.rawValue"
-                              class="h-8 min-w-0 text-xs"
-                              :placeholder="t('grid.filterBuilderValue')"
-                              @update:model-value="
-                                (value) => updateStructuredFilterRule(rule.id, { rawValue: String(value ?? '') })
-                              "
-                              @keydown.enter.prevent="applyStructuredFilters"
-                            />
-                            <div
-                              v-else
-                              class="flex h-8 items-center rounded-md border border-dashed px-2 text-xs text-muted-foreground"
-                            >
-                              {{ t("grid.filterBuilderNoValue") }}
+                          <template v-for="(rule, index) in structuredFilterRules" :key="rule.id">
+                            <div v-if="index > 0" class="flex justify-center">
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                class="h-6 px-2 text-[11px] font-medium text-muted-foreground hover:text-foreground"
+                                @click="
+                                  updateStructuredFilterRule(rule.id, {
+                                    conjunction: rule.conjunction === 'AND' ? 'OR' : 'AND',
+                                  })
+                                "
+                              >
+                                {{ rule.conjunction }}
+                              </Button>
                             </div>
-
-                            <Button
-                              variant="ghost"
-                              size="icon"
-                              class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
-                              :disabled="structuredFilterRules.length === 1"
-                              @click="removeStructuredFilterRule(rule.id)"
+                            <div
+                              class="grid grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_minmax(0,1.2fr)_auto] items-center gap-2"
                             >
-                              <Trash2 class="h-3.5 w-3.5" />
-                            </Button>
-                          </div>
+                              <Select
+                                :model-value="rule.columnName"
+                                @update:model-value="
+                                  (value: any) => updateStructuredFilterRule(rule.id, { columnName: String(value) })
+                                "
+                              >
+                                <SelectTrigger class="h-8 min-w-0 text-xs">
+                                  <SelectValue :placeholder="t('grid.filterBuilderColumn')" />
+                                </SelectTrigger>
+                                <SelectContent position="popper">
+                                  <SelectItem
+                                    v-for="columnName in filterBuilderColumnOptions"
+                                    :key="columnName"
+                                    :value="columnName"
+                                  >
+                                    {{ columnName }}
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+
+                              <Select
+                                :model-value="rule.mode"
+                                @update:model-value="
+                                  (value: any) => updateStructuredFilterRule(rule.id, { mode: value as FilterMode })
+                                "
+                              >
+                                <SelectTrigger class="h-8 min-w-0 text-xs">
+                                  <SelectValue />
+                                </SelectTrigger>
+                                <SelectContent position="popper">
+                                  <SelectItem
+                                    v-for="option in filterModeOptions"
+                                    :key="option.value"
+                                    :value="option.value"
+                                  >
+                                    {{ t(option.labelKey) }}
+                                  </SelectItem>
+                                </SelectContent>
+                              </Select>
+
+                              <Input
+                                v-if="filterModeNeedsValue(rule.mode)"
+                                :model-value="rule.rawValue"
+                                class="h-8 min-w-0 text-xs"
+                                :placeholder="t('grid.filterBuilderValue')"
+                                @update:model-value="
+                                  (value) => updateStructuredFilterRule(rule.id, { rawValue: String(value ?? '') })
+                                "
+                                @keydown.enter.prevent="applyStructuredFilters"
+                              />
+                              <div
+                                v-else
+                                class="flex h-8 items-center rounded-md border border-dashed px-2 text-xs text-muted-foreground"
+                              >
+                                {{ t("grid.filterBuilderNoValue") }}
+                              </div>
+
+                              <Button
+                                variant="ghost"
+                                size="icon"
+                                class="h-8 w-8 shrink-0 text-muted-foreground hover:text-destructive"
+                                :disabled="structuredFilterRules.length === 1"
+                                @click="removeStructuredFilterRule(rule.id)"
+                              >
+                                <Trash2 class="h-3.5 w-3.5" />
+                              </Button>
+                            </div>
+                          </template>
                         </div>
 
                         <div
@@ -3916,7 +4118,8 @@ defineExpose({
                             : 'bg-[rgb(239_239_239)] dark:bg-muted'
                         "
                         :style="{ width: `${transposeRecordWidth}px` }"
-                        @click="selectTransposeRecord(recordIndex)"
+                        @click="selectTransposeRecord(recordIndex, $event)"
+                        @contextmenu="selectTransposeRecord(recordIndex, $event)"
                       >
                         {{ recordIndex + 1 }}
                         <div
@@ -3946,6 +4149,12 @@ defineExpose({
                         class="relative shrink-0 border-r border-border/70 px-2 py-1.5 font-mono truncate"
                         :class="{
                           'text-muted-foreground italic': cell.isNull,
+                          'cell-selected':
+                            transposeCellIsSelected(cell.recordIndex, cell.valueIndex) &&
+                            !displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
+                          'cell-selected-dirty':
+                            transposeCellIsSelected(cell.recordIndex, cell.valueIndex) &&
+                            displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                           'bg-primary/10': cell.recordIndex === transposeRowIndex,
                           'bg-yellow-500/10 cell-dirty': displayItems[cell.recordIndex]?.isDirtyCol[cell.valueIndex],
                           'cursor-text hover:bg-accent/50': canEditCellItem(
@@ -3955,7 +4164,10 @@ defineExpose({
                         }"
                         :style="{ width: `${transposeRecordWidth}px` }"
                         :title="cell.display"
-                        @click="selectTransposeRecord(cell.recordIndex)"
+                        @click="selectTransposeCell(cell.recordIndex, cell.valueIndex, $event)"
+                        @mouseenter="onTransposeCellMouseenter(cell.recordIndex, cell.valueIndex)"
+                        @mouseleave="onCellMouseleave(cell.recordIndex, cell.valueIndex)"
+                        @contextmenu="onTransposeCellContext(cell.recordIndex, cell.valueIndex, $event)"
                         @dblclick.stop="
                           canEditCellItem(displayItems[cell.recordIndex], cell.valueIndex) &&
                           startEdit(displayItems[cell.recordIndex].id, cell.valueIndex)
@@ -3988,6 +4200,15 @@ defineExpose({
                         </template>
                         <template v-else>
                           {{ cell.display }}
+                          <button
+                            v-if="cellDetailButtonVisible(cell.recordIndex, cell.valueIndex)"
+                            class="absolute right-0.5 top-0.5 flex h-5 w-5 items-center justify-center rounded bg-background/90 text-muted-foreground shadow-sm ring-1 ring-border hover:text-foreground"
+                            :title="t('grid.cellDetails')"
+                            @mousedown.stop
+                            @click.stop="showCellDetails(cell.recordIndex, cell.valueIndex)"
+                          >
+                            <Info class="h-3 w-3" />
+                          </button>
                         </template>
                       </div>
                       <div class="shrink-0" :style="{ width: `${transposeRecordWindow.afterWidth}px` }" />
@@ -4003,8 +4224,9 @@ defineExpose({
                 >
                   <div class="flex text-xs font-semibold text-foreground" :style="{ width: 'var(--header-total-w)' }">
                     <div
-                      class="shrink-0 px-2 py-1.5 border-r border-border text-center text-muted-foreground select-none"
+                      class="shrink-0 px-2 py-1.5 border-r border-border text-center text-muted-foreground select-none cursor-pointer hover:bg-accent/60"
                       :style="{ width: 'var(--row-num-w)' }"
+                      @click="selectAllCells"
                     >
                       #
                     </div>
@@ -4014,18 +4236,16 @@ defineExpose({
                           class="shrink-0 px-2 py-1.5 border-r border-border whitespace-nowrap hover:bg-accent/60 select-none relative overflow-hidden"
                           :class="{
                             'bg-primary/15 ring-1 ring-inset ring-primary/40':
-                              highlightedColumnIndex === actualColumnIndex(colIdx),
+                              highlightedColumnIndex === actualColumnIndex(colIdx) || columnIsSelected(colIdx),
                           }"
                           :style="{ width: `var(--col-w-${colIdx})` }"
                           :data-grid-column-index="actualColumnIndex(colIdx)"
+                          @click="selectColumn(colIdx, $event)"
                           @contextmenu="onHeaderContext(col)"
                         >
                           <span class="flex min-w-0 items-center gap-1 overflow-hidden">
                             <span class="flex min-w-0 flex-1 flex-col overflow-hidden">
-                              <span
-                                class="min-w-0 truncate cursor-pointer leading-4"
-                                @click="toggleSort(col, actualColumnIndex(colIdx))"
-                              >
+                              <span class="min-w-0 truncate leading-4">
                                 {{ col }}
                               </span>
                               <span
@@ -4850,7 +5070,7 @@ defineExpose({
                 v-else-if="activeTableInfoTab === 'ddl' && !ddlLoading"
                 class="flex-1 min-w-0 text-xs font-mono p-3 overflow-auto ddl-code leading-5 select-text"
                 :class="ddlWrap ? 'whitespace-pre-wrap break-words' : 'whitespace-pre'"
-                v-html="highlightSql(ddlContent)"
+                v-html="highlightedDdlContent"
               ></pre>
               <div v-else class="flex-1 flex items-center justify-center">
                 <Loader2 class="w-4 h-4 animate-spin text-muted-foreground" />
@@ -4958,13 +5178,7 @@ defineExpose({
                           @cancel="cancelDetailEdit"
                           @commit="commitDetailEdit"
                         />
-                        <textarea
-                          v-else
-                          v-model="detailEditValue"
-                          wrap="off"
-                          class="w-full h-40 overflow-auto rounded border bg-background p-2 font-mono text-xs outline-none resize-y focus:border-primary"
-                          @keydown.escape.stop="cancelDetailEdit"
-                        />
+                        <div v-else ref="detailsEditorContainer" class="w-full h-40 rounded border overflow-hidden" />
                         <div class="flex gap-1 mt-1">
                           <Button size="sm" class="h-6 text-xs" @click="commitDetailEdit">
                             {{ t("dangerDialog.confirm") }}
@@ -5061,13 +5275,10 @@ defineExpose({
                       @cancel="cancelValueEditorEdit"
                       @commit="commitValueEditorEdit"
                     />
-                    <textarea
+                    <div
                       v-else
-                      v-model="detailEditValue"
-                      wrap="off"
-                      class="min-h-0 flex-1 w-full overflow-auto rounded border bg-background p-2 font-mono text-xs outline-none resize-none focus:border-primary"
-                      @blur="commitValueEditorEdit"
-                      @keydown.escape.stop="restoreDetailOriginalValue"
+                      ref="valueEditorContainer"
+                      class="min-h-0 flex-1 w-full rounded border overflow-hidden"
                     />
                   </div>
                   <div class="flex gap-1 mt-2 shrink-0">
@@ -5154,7 +5365,7 @@ defineExpose({
           <ContextMenuSubContent class="w-max max-w-[min(80vw,18rem)]">
             <ContextMenuItem v-if="contextColumn" @click="copyCell">{{ t("grid.copyCell") }}</ContextMenuItem>
             <ContextMenuItem @click="copyRow">
-              {{ isMultiRow ? t("grid.copyRows", { count: multiRowCount }) : t("grid.copyRow") }}
+              {{ copyRowJsonLabel }}
             </ContextMenuItem>
             <ContextMenuItem :disabled="!canCopyPreparedInsert(false)" @click="copyRowAsInsert">
               {{ isMultiRow ? t("grid.copyRowsInsert", { count: multiRowCount }) : t("grid.copyRowInsert") }}

@@ -175,7 +175,7 @@ impl AppState {
                 PoolKind::Mysql(db::mysql::connect_bare(&url).await?, MysqlMode::Bare)
             }
             DatabaseType::Mysql => {
-                let pool = db::mysql::connect(&url).await?;
+                let pool = db::mysql::connect_with_ca_cert(&url, Some(&db_config.ca_cert_path)).await?;
                 let mode = detect_ob_oracle_mode(&db_config, &pool).await;
                 PoolKind::Mysql(pool, mode)
             }
@@ -187,7 +187,11 @@ impl AppState {
             }
             DatabaseType::Sqlite => PoolKind::Sqlite(db::sqlite::connect_path(&expand_tilde(&db_config.host)).await?),
             DatabaseType::Redis => {
-                let con = db::redis_driver::connect(&url).await?;
+                let con = if db_config.uses_redis_sentinel() {
+                    db::redis_driver::connect_sentinel(&db_config).await?
+                } else {
+                    db::redis_driver::connect(&url).await?
+                };
                 PoolKind::Redis(tokio::sync::Mutex::new(con))
             }
             DatabaseType::DuckDb => {
@@ -611,9 +615,14 @@ fn native_postgres_url_config(config: &ConnectionConfig) -> Option<ConnectionCon
                 let params = normalized.url_params.as_deref().unwrap_or("").trim().trim_start_matches('?');
                 if !params.to_lowercase().contains("sslmode=") {
                     normalized.url_params = Some(if params.is_empty() {
-                        "sslmode=disable".to_string()
+                        if config.ssl {
+                            "sslmode=require".to_string()
+                        } else {
+                            "sslmode=disable".to_string()
+                        }
                     } else {
-                        format!("sslmode=disable&{params}")
+                        let sslmode = if config.ssl { "sslmode=require" } else { "sslmode=disable" };
+                        format!("{sslmode}&{params}")
                     });
                 }
             }
@@ -634,6 +643,8 @@ pub fn agent_connect_params(config: &ConnectionConfig, host: &str, port: u16, da
         config.connection_url_with_host(host, port)
     } else if config.db_type == DatabaseType::Oracle {
         oracle_jdbc_connection_string(config, host, port, database)
+    } else if matches!(config.db_type, DatabaseType::Kingbase | DatabaseType::Highgo | DatabaseType::Vastbase) {
+        postgres_like_agent_jdbc_connection_string(config, host, port, database)
     } else if config.db_type == DatabaseType::SapHana {
         sap_hana_jdbc_connection_string(config, host, port, database)
     } else {
@@ -709,6 +720,22 @@ fn oracle_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: u1
     }
 }
 
+fn postgres_like_agent_jdbc_connection_string(
+    config: &ConnectionConfig,
+    host: &str,
+    port: u16,
+    database: &str,
+) -> String {
+    let scheme = match config.db_type {
+        DatabaseType::Kingbase => "kingbase8",
+        DatabaseType::Highgo => "highgo",
+        DatabaseType::Vastbase => "vastbase",
+        _ => unreachable!("postgres-like agent JDBC URL requested for {:?}", config.db_type),
+    };
+    let base = format!("jdbc:{scheme}://{host}:{port}/{}", database.trim());
+    append_agent_url_params(base, config.url_params.as_deref())
+}
+
 pub fn should_retry_oracle_with_10g_driver(config: &ConnectionConfig, err: &str) -> bool {
     if config.db_type != DatabaseType::Oracle {
         return false;
@@ -751,6 +778,15 @@ fn sap_hana_jdbc_connection_string(config: &ConnectionConfig, host: &str, port: 
     } else {
         format!("jdbc:sap://{host}:{port}/?{}", query_parts.join("&"))
     }
+}
+
+fn append_agent_url_params(base: String, params: Option<&str>) -> String {
+    let params = params.unwrap_or("").trim().trim_start_matches(['?', '&']);
+    if params.is_empty() {
+        return base;
+    }
+    let separator = if base.contains('?') { '&' } else { '?' };
+    format!("{base}{separator}{params}")
 }
 
 fn duckdb_paths_match(left: &str, right: &str) -> bool {
@@ -875,6 +911,12 @@ mod tests {
             sysdba: false,
             oracle_connection_type: None,
             connection_string: None,
+            redis_connection_mode: None,
+            redis_sentinel_master: String::new(),
+            redis_sentinel_nodes: String::new(),
+            redis_sentinel_username: String::new(),
+            redis_sentinel_password: String::new(),
+            redis_sentinel_tls: false,
             external_config: None,
             jdbc_driver_class: None,
             jdbc_driver_paths: Vec::new(),
@@ -950,6 +992,49 @@ mod tests {
 
         assert_eq!(params["database"], "ORCLPDB1");
         assert_eq!(params["connection_string"], "jdbc:oracle:thin:@//oracle.example.com:1521/ORCLPDB1");
+    }
+
+    #[test]
+    fn agent_connect_params_build_postgres_like_agent_connection_string_for_selected_database() {
+        let cases = [
+            (
+                DatabaseType::Kingbase,
+                "kingbase.example.com",
+                54321,
+                "jdbc:kingbase8://kingbase.example.com:54321/platform_face_jgj",
+                "jdbc:kingbase8://kingbase.example.com:54321/platform_face_freezer_jgj?sslmode=disable",
+            ),
+            (
+                DatabaseType::Highgo,
+                "highgo.example.com",
+                5866,
+                "jdbc:highgo://highgo.example.com:5866/highgo",
+                "jdbc:highgo://highgo.example.com:5866/platform_face_freezer_jgj?sslmode=disable",
+            ),
+            (
+                DatabaseType::Vastbase,
+                "vastbase.example.com",
+                5432,
+                "jdbc:vastbase://vastbase.example.com:5432/postgres",
+                "jdbc:vastbase://vastbase.example.com:5432/platform_face_freezer_jgj?sslmode=disable",
+            ),
+        ];
+
+        for (db_type, host, port, stale_connection_string, expected_connection_string) in cases {
+            let mut config = mysql_config(Some("platform_face_jgj"));
+            config.db_type = db_type;
+            config.host = host.to_string();
+            config.port = port;
+            config.username = "system".to_string();
+            config.password = "secret".to_string();
+            config.url_params = Some("sslmode=disable".to_string());
+            config.connection_string = Some(stale_connection_string.to_string());
+
+            let params = agent_connect_params(&config, host, port, "platform_face_freezer_jgj");
+
+            assert_eq!(params["database"], "platform_face_freezer_jgj");
+            assert_eq!(params["connection_string"], expected_connection_string);
+        }
     }
 
     #[test]
@@ -1155,6 +1240,20 @@ mod tests {
         assert_eq!(
             connection_url_for_endpoint(&config, &config.host, config.port),
             "postgres://gaussdb:secret@127.0.0.1:3306/postgres?sslmode=require&application_name=dbx"
+        );
+    }
+
+    #[test]
+    fn gaussdb_endpoint_url_uses_require_sslmode_when_tls_enabled() {
+        let mut config = mysql_config(Some("postgres"));
+        config.db_type = DatabaseType::Gaussdb;
+        config.username = "gaussdb".to_string();
+        config.password = "secret".to_string();
+        config.ssl = true;
+
+        assert_eq!(
+            connection_url_for_endpoint(&config, &config.host, config.port),
+            "postgres://gaussdb:secret@127.0.0.1:3306/postgres?sslmode=require"
         );
     }
 
